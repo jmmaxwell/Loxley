@@ -1,8 +1,82 @@
-library(MASS)
+---
+title: "R Notebook"
+output: html_notebook
+---
 
-######################################################
-### Three central functions within main loop
-######################################################
+```{r}
+library(knitr)
+library(RPostgreSQL)
+library(dplyr)
+library(ggplot2)
+
+
+myRedshift <- src_postgres('cust_analytics_prd',
+                           host = 'a0036-ei-analytics.c9gybgr1jgvx.us-west-2.redshift.amazonaws.com',
+                           port = 5439,
+                           user = "datalab", 
+                           password = "DataLab1")
+
+dat <- tbl(myRedshift, sql(
+  paste0(
+    "select
+    min(session_date) session_date,
+    arm,
+    case
+      when sum(rec_engagement) > 0 then 1
+      else 0
+    end rec_engagement,
+    case
+      when sum(did_purchase) > 0 then 1
+      else 0
+    end did_purchase
+    from (
+      select 
+        c.cookie_id,
+        c.session_id,
+        c.session_date,
+        c.arm,
+        case
+          when r.session_id is null then 0
+          else 1
+        end rec_engagement,
+        case
+          when p.session_id is null then 0
+          else 1
+        end did_purchase
+      from analytics_user_vws.pdp_eda_cohort c
+        left join analytics_user_vws.pdp_eda_rec_clks r on r.session_id = c.session_id
+        left join analytics_user_vws.pdp_eda_item_purchases p on p.session_id = c.session_id
+      where test = 2
+    )
+    group by cookie_id, arm
+    order by session_date asc"
+  )))
+
+dat <- collect(dat, n=Inf)
+
+```
+
+
+```{r}
+
+dat %>%
+  group_by(arm, rec_engagement) %>%
+  summarise(ct = n(), purs = sum(did_purchase)) %>%
+  mutate(prop = purs/ct)
+  
+```
+```{r}
+dat %>%
+  group_by(arm) %>%
+  summarise(ct = n(), purs = sum(did_purchase)) %>%
+  mutate(prop = purs/ct)
+```
+
+
+
+```{r}
+
+library(MASS)
 
 get_theta_hat_alpha <- function(b_rec, A_rec, B_rec, beta_hat){
   return(ginv(A_rec) %*% (b_rec - B_rec %*% beta_hat))
@@ -67,33 +141,16 @@ update_b_0_again <- function(b_0, r_t, z_t_rec, B_rec, A_rec, b_rec){
   return(new_b_0)
 }
 
-######################################################
-### Test this thing!
-######################################################
-library(dplyr)
-
-user_data <- data_frame(
-  age = sample(18:70, 1000, replace = T),
-  gender = sample(c(0, 1), 1000, replace = T)
-)
-
-article_data <- data_frame(
-  name = c(1:5),
-  type = c(1,1,1,2,2),
-  var = c(1,2,2,2,2)
-)
-
-
 # Trials, the number of trials
-trials <- 1000
+trials <- 2000
 # arms TODO: fix this so arms can vary
-arms <- 5
+arms <- 3
 # alpha, arbitarily set to 3
 alpha <- 3
 # dimensions of the single arm features, d
-d <- 3
+d <- 1
 # dimensions of the shared features, k
-k <- 5
+k <- 1
 # A0, a k-dimensional identity matrix
 A_0 <- diag(k)
 # B0, a k-length zero vector
@@ -114,8 +171,15 @@ arm_choice <- c()
 #reward vector
 reward <- c()
 
-for (t in 1:trials){
+arm_data <- data_frame(
+  name = unique(dat$arm),
+  num = c(3, 1, 2)
+)
 
+
+
+for (t in 1:trials){
+  
   beta_hat <- ginv(A_0) %*% b_0
   
   for (a in 1:arms){
@@ -128,8 +192,8 @@ for (t in 1:trials){
     
     theta[[a]] <- get_theta_hat_alpha(b[[a]], A[[a]], B[[a]], beta_hat)
     
-    z_t_rec <- matrix(as.numeric(c(user_data[t,], article_data[a,])), 5, 1)
-    x_t_rec <- matrix(as.numeric(c(user_data[t,], a)), 3, 1)
+    z_t_rec <- matrix(as.numeric(a), 1, 1)
+    x_t_rec <- matrix(as.numeric(a), 1, 1)
     
     s_t_a[[t, a]] <- get_s_t_rec(z_t_rec, A_0, B[[a]], A[[a]], x_t_rec)
     p_t_a[[t, a]] <- get_p_t_rec(z_t_rec, beta_hat, x_t_rec, theta[[a]], alpha, s_t_a[[t, a]])
@@ -138,11 +202,14 @@ for (t in 1:trials){
 
   arm_choice[t] <- which(p_t_a[t,] == max(p_t_a[t,]))
   #changing this reward policy will cause the alg to solve differently (meaning this works!!!!)
-  reward[t] <- ifelse(z_t_rec[2] == 0, ifelse(sqrt(arm_choice[t])*runif(1) > 1, 1, 0),
-                      ifelse(1/(arm_choice[t])*runif(1) > .4, 1, 0))
+  reward[t] <- if(arm_data$name[which(arm_data$num == arm_choice[t])] == dat$arm[t]){
+    reward[t] <- dat$did_purchase[t]
+  }else{
+    next
+  }
   
-  z_t_rec <- matrix(as.numeric(c(user_data[t,], article_data[arm_choice[t],])), 5, 1)
-  x_t_rec <- matrix(as.numeric(c(user_data[t,], arm_choice[t])), 3, 1)
+  z_t_rec <- matrix(as.numeric(c(dat$rec_engagement[t], a)), 1, 1)
+  x_t_rec <- matrix(as.numeric(c(dat$rec_engagement[t], a)), 1, 1)
   
   A_0 <- update_A_0(A_0, B[[arm_choice[t]]], A[[arm_choice[t]]])
   b_0 <- update_b_0(b_0, B[[arm_choice[t]]], A[[arm_choice[t]]], b[[arm_choice[t]]])
@@ -153,17 +220,24 @@ for (t in 1:trials){
   b_0 <- update_b_0_again(b_0, reward[t], z_t_rec, B[[arm_choice[t]]], A[[arm_choice[t]]], b[[arm_choice[t]]])
 
 }
-  
 
-dat <- data.frame(arm_choice, reward)
-dat <- cbind(dat, user_data)
-dat %>%
-  group_by(arm_choice, gender) %>%
-  summarise(ct = n(), r = sum(reward)) %>%
+
+new_dat <- data_frame(reward, arm_choice)
+
+old_dat <- dat[1:trials,]
+
+new_dat <- cbind(new_dat, old_dat)
+
+new_dat <- new_dat %>%
+  filter(!is.na(reward))
+
+new_dat %>%
+  group_by(arm_choice) %>%
+  summarise(ct = n(), r = sum(reward, na.rm = T)) %>%
   mutate(prop = r/ct)
 
-dat %>%
-  inner_join(article_data, by = c("arm_choice" = "name")) -> dat
+```
 
-reg <- lm(reward ~ arm_choice + age + gender + type + var, dat)
-summary(reg)
+
+
+

@@ -1,0 +1,264 @@
+---
+title: "Exploring Contextual Bandits 1: LinUCB with Linear Disjoint Models"
+output: html_notebook
+---
+
+I've been interested in contextual bandit algorithms lately so I thought I would document my experience as I explore the literature. I will write basic implementations of the algorithms I read about in R for learning purposes. I may write a post or two about my experience implementing them in production and, if possible, I will share more production appropraite implementations. 
+
+### The Situation
+
+First I will talk about the LinUCB algorithm with linear disjoint models. I'm following (FIND THE PAPER AND CITE IT). I'm starting with this paper is because it is the most cited paper on contextual bandits and I found it (sort of) easy to follow.
+
+In this paper, the authors focus on choosing which articles to put on the homepage of a site. Say, for example, they had 3 articles but only space for 1, they could use the LinUCB algorithm to find which of the articles is best. More interstingly, if they had some features about their users--say if they had clicked on a sports article in the past or if they had clicked on a politics article in the past--the algorithm can take that into account and find which articles are best for people given their past click behaviors.
+
+### Some Fake Data
+
+I'll start by simulating data for this situation:
+
+```{r}
+library(dplyr)
+library(broom)
+library(MASS)
+library(ggplot2)
+```
+
+```{r, echo=TRUE}
+n <- 10000
+
+bandit_data <- data_frame(
+  clicked_sports = sample(c(0,1), n, prob = c(0.6, 0.4), replace = T),
+  clicked_politics = sample(c(0,1), n, prob = c(0.7, 0.3), replace = T),
+  arm = sample(c(1:3), n, replace =  T),
+  sports_coef = case_when(arm == 1 ~ .5,
+                          arm == 2 ~ .1,
+                          arm == 3 ~ .1),
+  politics_coef = case_when(arm == 1 ~ .1,
+                            arm == 2 ~ .1,
+                            arm == 3 ~ .4),
+  arm_baseline = case_when(arm == 1 ~ .1,
+                           arm == 2 ~ .2,
+                           arm == 3 ~ .1),
+  rand_draw = runif(n)
+) %>%
+  mutate(click_factor = arm_baseline + sports_coef * clicked_sports + politics_coef * clicked_politics) %>%
+  mutate(click = ifelse(click_factor >= rand_draw, 1, 0))
+```
+
+Let's make sure that is doing what we want it to:
+
+```{r}
+bandit_data %>%
+  group_by(arm, clicked_sports, clicked_politics) %>%
+  summarise(ct = n(), reward = sum(click), mean_clk_rt = mean(click)) %>%
+  group_by(clicked_sports, clicked_politics) %>%
+  filter(mean_clk_rt == max(mean_clk_rt))
+
+```
+
+So, we can see from this that arm 2 is best for people who clicked nothing, arm 3 is best when they clicked politics, and arm 1 is best when they clicked sports or if they clicked both. Let's see if the LinUCB can figure this out!
+
+### The Algorithm
+
+First, I'm going to explain the algorithm--somewhat pedantically because I want to ensure that I can remember how this works in the future. Roughly, this is what happens: at each step, we run a linear regression with the data we have collected so far such that we have a coefficient for clicked_sports and clicked_politics. We then observe our new context (in this case the clicked_sports and clicked_politics variables), and generate a confidence interval that is likely to contain the true click through rate for each of the three arms using the linear models we have built. We then choose the arm with the highest upper confidence bound.
+
+##### Definitions
+
+To explain the details we need a few definitions:
+
+* $d$ is the number of features. In our case our features are clicked_politics and clicked_sports so $d = 2$.
+
+* $m$ is the number of observations (in this case users) we have.
+
+* $\mathbf{D}_a$ is the $m \times d$ design matrix containing observations of our 2 variables for arm $a$. It will look something like this:
+
+$$\begin{pmatrix}
+  1 & 1\\
+  0 & 1\\
+  1 & 0\\
+  0 & 0\\
+  \vdots & \vdots
+\end{pmatrix}$$
+
+* $\mathbf{c}_a$ is the vector of length $m$ for arm $a$ containing 1 if someone clicked and 0 otherwise. It could look like this:
+
+$$\begin{pmatrix}
+  1\\
+  0\\
+  1\\
+  0\\
+  \vdots
+\end{pmatrix}$$
+
+* $\hat{\boldsymbol\theta}_a$ is the vector of length 2 of coefficients we obtain from applying ridge regression to $\mathbf{D}_a$ and $\mathbf{c}_a$:
+
+$$\hat{\boldsymbol\theta}_a = (\mathbf{D}_a ^\intercal \mathbf{D}_a + \mathbf{I}_d)^{-1}\mathbf{D}_a ^\intercal\mathbf{c}_a$$
+
+* Following the authors and for convenience we will say that $\mathbf{A}_a = \mathbf{D}_a ^\intercal \mathbf{D}_a + \mathbf{I}_d$
+
+* $\mathbf{x}_{t,a}$ is a vector of length $d$ and is the context arm $a$ at time $t$. So this could be the following or some other combination of 0 and 1:
+
+$$\begin{pmatrix}
+  1\\
+  0\\
+\end{pmatrix}$$
+
+* Lastly, the crux of this algorithm: the arm we choose at each time ($a_t$) is found by calculating which arm gives the largest predicted payoff from our ridge regression for our currently observed context (given by $\mathbf{x}_{t,a}^\intercal\hat{\boldsymbol\theta}_a$) plus $\alpha$ times the standard deviation of the expected payoff. The variance of the payoff is given by $\mathbf{x}_{t,a}^\intercal{\mathbf{A}_a}^{-1}\mathbf{x}_{t,a}$, so the standard deviation is just the square root of that:
+
+$$a_t = {argmax}_{a \in A_t} \Big( \mathbf{x}_{t,a}^\intercal\hat{\boldsymbol\theta}_a + {\alpha}\sqrt{\mathbf{x}_{t,a}^\intercal{\mathbf{A}_a}^{-1}\mathbf{x}_{t,a}} \Big)$$
+
+We need two more definitions that will allow us to apply our ridge regression online and not just in batch.
+
+* ${r_t}$ is the payoff (clicked or didn't) we observe after we choose an arm in time $t$.
+
+* $\mathbf{b}_a$ is a vector of length $d$ that can be thought of as the $\mathbf{D}_a ^\intercal\mathbf{c}_a$ part of the ridge regression. We update it in every time period $t$ of the algorithm by by adding $r_t \mathbf{x}_{t,a_a}$ to it.
+
+##### Putting It Together
+
+Now that we have defined all the pieces we need, let's put them together as the LinUCB algorithm:
+
+1. Set $\alpha$
+2. Loop through every time period $t$ doing the following:
+    i. Observe the context ($\mathbf{x}_{t,a}$) and arms ($a_t$).
+    ii. Loop through each arm doing this:
+        1. If the arm hasn't been seen yet:
+            i. Instantiate $\mathbf{A}_a$ as a $d \times d$ identity matrix.
+            ii. Instantiate $\mathbf{b}_a$ as a 0 vector of length $d$.
+        2. Set $\hat{\boldsymbol\theta}_a = \mathbf{A}_a^{-1}\mathbf{b}_a$ (because remember that $\mathbf{A}_a$ is the first part of the ridge regression and $\mathbf{b}_a$ is the online variant of the second part).
+        3. Find the expected payoff $p_{t,a} = \mathbf{x}_{t,a}^\intercal\hat{\boldsymbol\theta}_a + {\alpha}\sqrt{\mathbf{x}_{t,a}^\intercal{\mathbf{A}_a}^{-1}\mathbf{x}_{t,a}}$
+    iii. End the arm loop.
+    iv. Choose the arm with the biggest $p_{t,a}$ (if there is a tie pick randomly among the winners).
+    v. Observe whether or not the user clicked: $r_t$.
+    vi. Update $\mathbf{A}_{a_t}$ by adding $\mathbf{x}_{t,a_a} \mathbf{x}_{t,a_a}^{\intercal}$ to it.
+    vii. Update $\mathbf{b}_a$ by adding ${r_t} \mathbf{x}_{t,a_a}$ to it.
+15. End the time period loop.
+
+So really, this is pretty simple: in every time period, we find the upper end the confidence interval of the payoff for each arm, and we just pick the arm with the highest one!
+
+##### How it Looks in R
+
+* First, we need to set a paramter $\alpha$ to control how much exploration should happen vs exploitation of the current best arm.
+```{r, echo=TRUE}
+alpha = 5
+```
+
+* Now we'll need some functions:
+
+```{r}
+library(MASS)
+
+inside_for_func <- function(inverse_cov_matrix, reward_vector_times_design_matrix, context_vector, alpha){
+  theta_hat <- inverse_cov_matrix %*% reward_vector_times_design_matrix
+  ucb_estimate <- t(theta_hat) %*% context_vector + 
+    alpha * sqrt(t(context_vector) %*% inverse_cov_matrix %*% context_vector)
+  return(ucb_estimate)
+}
+
+update_cov_matrix <- function(cov_matrix, context_vector){
+  return(cov_matrix + context_vector %*% t(context_vector))
+}
+
+update_reward_vector_times_design_matrix <- function(reward_vector_times_design_matrix, reward, context_vector){
+  return(reward_vector_times_design_matrix + reward * context_vector)
+}
+
+```
+
+* We need to give the algorithm some info and instantiate some objects:
+
+```{r}
+arms <- c(1:3)
+d <- 2
+arm_choice <- c()
+cov_matrix <- list()
+reward_vector_times_design_matrix <- list()
+ucb_estimate <- matrix(0, n, length(arms))
+coef1 <- c()
+coef2 <- c()
+```
+
+* Now we should be ready! The way we can run this bandit algorithm on the fake data we created above is by only keeping an observation when the bandit agrees on the arm choice of the randomized arm choices I set up in the initial dataset. This is actually a really simple technique one can use for training a contextual bandit before deploying it in production.
+
+```{r}
+for (t in 1:n){
+  context <- bandit_data[t,]
+  for (a in arms){
+    if(t == 1){
+      cov_matrix[[a]] <- diag(d)
+      reward_vector_times_design_matrix[[a]] <- rep(0, d)
+    }
+    inverse_cov_matrix <- ginv(cov_matrix[[a]])
+    ucb_estimate[t, a] <- inside_for_func(inverse_cov_matrix, 
+                    as.matrix(reward_vector_times_design_matrix[[a]]), 
+                    as.matrix(c(context$clicked_sports, context$clicked_politics)), 
+                    alpha)
+  }
+  trial_arm <- which(ucb_estimate[t,] == max(ucb_estimate[t,]))
+  if(length(trial_arm) > 1){
+    trial_arm <- sample(trial_arm, 1)
+  }
+  if(trial_arm == context$arm){
+    arm_choice[t] <- trial_arm
+  }else{
+    arm_choice[t] <- t*10
+    coef1[t] <- 999
+    coef2[t] <- 999
+    next
+  }
+  cov_matrix[[arm_choice[t]]] <- update_cov_matrix(cov_matrix[[arm_choice[t]]], 
+                                                as.matrix(c(context$clicked_sports, context$clicked_politics)))
+  reward_vector_times_design_matrix[[arm_choice[t]]] <- update_reward_vector_times_design_matrix(
+    as.matrix(reward_vector_times_design_matrix[[arm_choice[t]]]),
+    context$click,
+    as.matrix(c(context$clicked_sports, context$clicked_politics))
+  )
+  output <- ginv(cov_matrix[[arm_choice[t]]]) %*% reward_vector_times_design_matrix[[arm_choice[t]]]
+  coef1[t] <- output[1,1]
+  coef2[t] <- output[2,1]
+}
+
+```
+
+##### Diagnostics
+
+How did our bandit do? Well, first 
+
+```{r}
+library(purrr)
+library(tidyr)
+
+bandit_data$arm_choice <- arm_choice
+
+lm_fun <- function(data){
+  return(tidy(summary(lm(click ~ clicked_sports + clicked_politics, data))))
+}
+
+bandit_data %>%
+  nest(-arm) %>%
+  mutate(model = map(data, lm_fun)) %>%
+  unnest(model)
+
+```
+
+So we can see the coefficients for each variable. What are our learned coefficients?
+
+```{r}
+map_df(arms, function(i) data_frame(coefs = as.vector(ginv(cov_matrix[[i]]) %*% reward_vector_times_design_matrix[[i]]), arm = i, varibale = c("clicked_sports", "clicked_politics")))
+```
+
+Pretty close! So that cool. Now let's see what the average reward was over time:
+
+```{r}
+
+bandit_data %>%
+  filter(arm_choice < 10) %>%
+  group_by(clicked_sports, clicked_politics, arm_choice) %>%
+  mutate(total_reward = cumsum(click), trial = c(1:n())) %>%
+  mutate(avg_reward = total_reward/trial) %>%
+  ggplot(aes(x = trial, y = avg_reward, color = factor(arm), group = factor(arm))) +
+  geom_path() +
+  facet_wrap(~clicked_politics + clicked_sports)
+
+```
+
+
+[1] Li, Lihong, et al. "A contextual-bandit approach to personalized news article recommendation." Proceedings of the 19th international conference on World wide web. ACM, 2010.
