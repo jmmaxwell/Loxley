@@ -1,5 +1,7 @@
 library(MASS)
 
+### Adding another comment
+### Adding a comment
 ######################################################
 ### Three central functions within main loop
 ######################################################
