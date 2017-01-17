@@ -8,7 +8,7 @@ bibliography: refs.bib
 ---
 
 
-I've been interested in contextual bandit algorithms lately so I thought I would document my experience as I explore the literature. I will write basic implementations of the algorithms I read about in R for learning purposes. I may write a post or two about my experience implementing them in production and, if possible, I will share more production-appropriate implementations.
+I've been interested in contextual bandit algorithms lately so I thought I would document my experience as I explore the literature. I will write basic implementations of the algorithms I read about in R or Python for learning purposes. I may write a post or two about my experience implementing them in production and, if possible, I will share more production-appropriate implementations.
 
 # The Situation
 
@@ -73,7 +73,7 @@ So, we can see from this that arm 2 is best for people who clicked nothing, arm 
 
 # The Algorithm
 
-First, I'm going to explain the algorithm--somewhat pedantically because I want to ensure that I can remember how this works in the future. Roughly, this is what happens: at each step, we run a linear regression with the data we have collected so far such that we have a coefficient for clicked_sports and clicked_politics. We then observe our new context (in this case the clicked_sports and clicked_politics variables), and generate a confidence interval that is likely to contain the true click through rate for each of the three arms using the linear models we have built. We then choose the arm with the highest upper confidence bound.
+Roughly, this is how the algorithm works: at each step, we run a linear regression with the data we have collected so far such that we have a coefficient for clicked_sports and clicked_politics. We then observe our new context (in this case the clicked_sports and clicked_politics variables), and generate a predicted payoff using our model. We also generate a confidence interval for that predicted payoff (i.e. click through rate) for each of the three arms. We then choose the arm with the highest upper confidence bound.
 
 ### Definitions
 
@@ -148,12 +148,12 @@ So really, this is pretty simple: in every time period, we find the upper end th
 
 ### How it Looks in R
 
-* First, we need to set a parameter $\alpha$ to control how much exploration should happen vs exploitation of the current best arm.
+First, we need to set a parameter $\alpha$ to control how much exploration should happen vs exploitation of the current best arm.
 ```{r, echo=TRUE}
 alpha = 7
 ```
 
-* Now we'll need some functions:
+Now we'll need some functions:
 
 ```{r}
 library(MASS)
@@ -178,18 +178,20 @@ update_reward_vector_times_design_matrix <- function(reward_vector_times_design_
 
 ```
 
-* We need to give the algorithm some info and instantiate some objects:
+We need to give the algorithm some info and instantiate some objects:
 
 ```{r}
 arms <- c(1:3)
 d <- 2
 arm_choice <- c()
 cov_matrix <- list()
-reward_vector_times_design_matrix <- list()
+reward_vector_times_design_matrix <- list() # this corresponds to b_a above
 ucb_estimate <- matrix(0, n, length(arms))
 ```
 
-* Now we should be ready! The way we can run this bandit algorithm on the fake data we created above is by only keeping an observation when the bandit agrees on the arm choice of the randomized arm choices I set up in the initial dataset. This is actually a really simple technique one can use for training a contextual bandit before deploying it in production.
+Now we should be ready! The way we can run this bandit algorithm on the fake data we created above is by only keeping an observation when the bandit agrees on the arm choice of the randomized arm choices I set up in the initial dataset. This is actually a really simple technique one can use for training a contextual bandit before deploying it in production.
+
+The following is not written for efficiency--I'm trying to make it look as similar to the pseudocode as possible for readability.
 
 ```{r}
 for (t in 1:n){
@@ -277,7 +279,7 @@ As you can see, the algorithm eventually ends up giving an average reward close 
 
 # Conclusions and Next Steps
 
-We've seen now how the LinUCB algorithm with linear disjoint models works. I hope I have helped make the ideas around this algorithm and its most basic implementation easier to understand. If I haven't and you need clarification leave a comment. Also, please let me know if you see any errors. I hope to continue these posts, the next one being the later part of this same paper--the hybrid LinUCB algorithm in which the authors allow arms to share contextual variables. After that I'm not sure which paper I will tackle--but I'm open to suggestions.
+We've seen now how the LinUCB algorithm with linear disjoint models works. I hope I have helped make the ideas around this algorithm and its implementation easier to understand. If I haven't and you need clarification leave a comment. Also, please let me know if you see any errors. I hope to continue these posts, the next one being the later part of this same paper--the hybrid LinUCB algorithm in which the authors allow arms to share contextual variables. After that I'm not sure which paper I will tackle--but I'm open to suggestions.
 
 # References
 
